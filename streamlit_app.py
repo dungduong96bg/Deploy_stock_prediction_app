@@ -1,7 +1,6 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
 import time
@@ -28,8 +27,28 @@ and predict future prices using an **LSTM-DNN Hybrid Model**.
 # Sidebar for inputs
 st.sidebar.header("Configuration")
 symbol = st.sidebar.text_input("Enter Stock Symbol (e.g., FPT, VCB)", value="FPT").upper()
+exchange = st.sidebar.selectbox("Select Exchange", ["HOSE", "HNX", "UPCOM", "NASDAQ", "NYSE"], index=0)
 lookback = st.sidebar.slider("Lookback Period (Days)", min_value=30, max_value=120, value=60)
 epochs = st.sidebar.slider("Training Epochs", min_value=10, max_value=100, value=20)
+
+# Caching data fetching
+@st.cache_data(ttl=3600)  # Cache for 1 hour
+def fetch_data(symbol):
+    return get_stock_data(symbol, start_date="2018-01-01")
+
+# Caching model training
+@st.cache_resource
+def train_model(symbol, lookback, epochs, _data):
+    """
+    Train the model and return the predictor object and history.
+    Using _data to prevent hashing the dataframe which can be slow.
+    We rely on symbol/lookback/epochs to trigger retraining.
+    """
+    predictor = StockMarketPredictor(lookback=lookback)
+    X_train, X_test, y_train, y_test, scaled_data = predictor.prepare_data(_data)
+    
+    history = predictor.train(X_train, y_train, X_test, y_test, epochs=epochs, batch_size=32)
+    return predictor, history, X_test, y_test, scaled_data
 
 # Main content
 if symbol:
@@ -37,8 +56,7 @@ if symbol:
     st.subheader(f"1. Historical Data for {symbol}")
     
     with st.spinner(f"Fetching data for {symbol}..."):
-        # Fetch data from year 2018 to ensure enough data for training
-        df = get_stock_data(symbol, start_date="2018-01-01")
+        df = fetch_data(symbol)
     
     if df is not None:
         # Display Data
@@ -47,9 +65,7 @@ if symbol:
         # TradingView Widget
         st.subheader("2. TradingView Chart")
         
-        # Mapping for TradingView (assuming Vietnam stocks are on HOSE/HNX, but TradingView symbol format might vary)
-        # For simplicity, we try to use the symbol directly or prefix with 'HOSE:'
-        tv_symbol = f"HOSE:{symbol}"
+        tv_symbol = f"{exchange}:{symbol}"
         
         html_code = f"""
         <!-- TradingView Widget BEGIN -->
@@ -87,19 +103,9 @@ if symbol:
             status_text = st.empty()
             
             try:
-                # Initialize Predictor
-                status_text.text("Initializing model...")
-                predictor = StockMarketPredictor(lookback=lookback)
-                
-                # Prepare Data
-                status_text.text("Preparing data...")
-                X_train, X_test, y_train, y_test, scaled_data = predictor.prepare_data(df)
-                
-                progress_bar.progress(20)
-                
-                # Train
-                status_text.text(f"Training model for {epochs} epochs... This may take a while.")
-                history = predictor.train(X_train, y_train, X_test, y_test, epochs=epochs, batch_size=32)
+                # Train or Load Model
+                status_text.text("Training model... (Cached if parameters unchanged)")
+                predictor, history, X_test, y_test, scaled_data = train_model(symbol, lookback, epochs, df)
                 
                 progress_bar.progress(80)
                 
@@ -117,49 +123,63 @@ if symbol:
                 col3.metric("MSE", f"{metrics['MSE']:.4f}")
                 col4.metric("RMSE", f"{metrics['RMSE']:.4f}")
                 
-                # Plot Results using Plotly for interactivity
-                st.subheader("Prediction vs Actual")
+                # --- Next Day Prediction Logic ---
+                # Get the last 'lookback' days from the scaled data to predict the next day
+                last_sequence = scaled_data[-lookback:]
+                last_sequence = last_sequence.reshape(1, lookback, scaled_data.shape[1])
                 
-                # Create a DataFrame for plotting
-                # y_test and predictions are scaled values? No, wait.
-                # In stock_market_prediction.py:
-                # y is from scaled_data.
-                # predictions are output of model.predict(X_test).
-                # Both are scaled. We need to inverse transform them to get actual prices.
+                next_day_prediction_scaled = predictor.model.predict(last_sequence)
                 
-                # Inverse Transform
-                # The scaler was fitted on ['Open', 'High', 'Low', 'Close', 'Volume']
-                # We need to inverse transform carefully.
-                
-                # Let's look at how we can inverse transform.
-                # The scaler is in predictor.scaler
-                # It expects 5 features.
-                # We have y_test (1 feature: Close) and predictions (1 feature: Close).
-                # We need to construct a dummy array with 5 features to inverse transform, 
-                # or just manually unscale if we know the min/max of the Close column.
-                # But MinMaxScaler scales each feature independently.
-                
-                # Let's access the scaler's min and scale for the Close column.
-                # features = ['Open', 'High', 'Low', 'Close', 'Volume']
-                # Close is at index 3.
-                
+                # Inverse Transform Logic
                 scaler = predictor.scaler
-                close_min = scaler.data_min_[3]
+                close_min = scaler.data_min_[3] # Close is at index 3
                 close_range = scaler.data_range_[3]
                 
+                next_day_price = next_day_prediction_scaled[0][0] * close_range + close_min
+                
+                st.success(f"### 🔮 Predicted Price for Next Trading Day: {next_day_price:,.0f} VND")
+                
+                # --- Plot Results with Dates ---
+                st.subheader("Prediction vs Actual")
+                
+                # Get dates for the test set
+                # The test set is the last 20% of the data (minus lookback adjustment)
+                # In prepare_data:
+                # X has length: len(scaled_data) - lookback
+                # split_idx = int(len(X) * 0.8)
+                # X_test starts from split_idx
+                
+                # So the corresponding dates for y_test start from:
+                # lookback + split_idx
+                
+                total_samples = len(scaled_data) - lookback
+                split_idx = int(total_samples * 0.8)
+                test_start_idx = lookback + split_idx
+                
+                # df['Date'] aligns with scaled_data indices
+                test_dates = df['Date'].iloc[test_start_idx:].values
+                
+                # Inverse Transform Test Data
                 y_test_actual = y_test * close_range + close_min
                 predictions_actual = predictions.flatten() * close_range + close_min
                 
+                # Ensure lengths match (sometimes off by 1 due to slicing)
+                min_len = min(len(test_dates), len(y_test_actual))
+                test_dates = test_dates[:min_len]
+                y_test_actual = y_test_actual[:min_len]
+                predictions_actual = predictions_actual[:min_len]
+                
                 # Plot
                 fig = go.Figure()
-                fig.add_trace(go.Scatter(y=y_test_actual, mode='lines', name='Actual Price', line=dict(color='blue')))
-                fig.add_trace(go.Scatter(y=predictions_actual, mode='lines', name='Predicted Price', line=dict(color='red', dash='dash')))
+                fig.add_trace(go.Scatter(x=test_dates, y=y_test_actual, mode='lines', name='Actual Price', line=dict(color='blue')))
+                fig.add_trace(go.Scatter(x=test_dates, y=predictions_actual, mode='lines', name='Predicted Price', line=dict(color='red', dash='dash')))
                 
                 fig.update_layout(
                     title=f"{symbol} Price Prediction",
-                    xaxis_title="Time Steps (Test Set)",
+                    xaxis_title="Date",
                     yaxis_title="Price (VND)",
-                    template="plotly_white"
+                    template="plotly_white",
+                    hovermode="x unified"
                 )
                 
                 st.plotly_chart(fig, use_container_width=True)
@@ -175,6 +195,8 @@ if symbol:
             except Exception as e:
                 st.error(f"An error occurred during training/prediction: {e}")
                 st.error("Please check if the data is sufficient or try a different symbol.")
+                import traceback
+                st.text(traceback.format_exc())
                 
     else:
         st.warning(f"Could not fetch data for {symbol}. Please check the symbol and try again.")
