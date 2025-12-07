@@ -10,15 +10,14 @@ vn30_list = [
         "TCB", "TPB", "VCB", "VHM", "VIB", "VIC", "VJC", "VNM", "VPB", "VRE"
     ]
 
-def get_full_vn30_history():
-    # 1. Cấu hình thời gian
-    # Lấy từ quá khứ xa (năm 2000) để đảm bảo lấy hết dữ liệu lịch sử
-    start_date = "2000-01-01"
-    end_date = datetime.now().strftime("%Y-%m-%d")  # Lấy đến hiện tại (2025-11-29)
+def get_stock_data(symbol, start_date="2000-01-01", end_date=None):
+    """
+    Fetch historical data for a single stock symbol from FireAnt.
+    """
+    if end_date is None:
+        end_date = datetime.now().strftime("%Y-%m-%d")
 
-    # 3. Cấu hình API
     base_url = "https://svr2.fireant.vn/api/Data/Companies/HistoricalQuotes"
-
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Accept': 'application/json',
@@ -26,48 +25,70 @@ def get_full_vn30_history():
         'Origin': 'https://fireant.vn'
     }
 
+    print(f"Fetching data for {symbol} from {start_date} to {end_date}...")
+
+    try:
+        params = {
+            'symbol': symbol,
+            'startDate': start_date,
+            'endDate': end_date
+        }
+
+        response = requests.get(base_url, params=params, headers=headers, timeout=15)
+
+        if response.status_code == 200:
+            data = response.json()
+
+            if data and isinstance(data, list) and len(data) > 0:
+                df_temp = pd.DataFrame(data)
+                df_temp['Symbol'] = symbol
+                if 'Date' in df_temp.columns:
+                    df_temp['Date'] = pd.to_datetime(df_temp['Date']).dt.date
+                
+                # Rename columns to match expected format
+                rename_map = {
+                    'AdjClose': 'Close', 
+                    'AdjOpen': 'Open', 
+                    'AdjHigh': 'High', 
+                    'AdjLow': 'Low'
+                }
+                # Only rename if columns exist
+                df_temp = df_temp.rename(columns={k: v for k, v in rename_map.items() if k in df_temp.columns})
+                
+                # Ensure required columns exist
+                required_cols = ['Date', 'Symbol', 'Close', 'Open', 'High', 'Low', 'Volume']
+                available_cols = [col for col in required_cols if col in df_temp.columns]
+                df_temp = df_temp[available_cols]
+                
+                print(f"Successfully fetched {len(df_temp)} records for {symbol}.")
+                return df_temp
+            else:
+                print(f"No data returned for {symbol}.")
+                return None
+        else:
+            print(f"HTTP Error {response.status_code} for {symbol}.")
+            return None
+
+    except Exception as e:
+        print(f"Exception fetching data for {symbol}: {e}")
+        return None
+
+
+def get_full_vn30_history():
+    # 1. Cấu hình thời gian
+    start_date = "2000-01-01"
+    end_date = datetime.now().strftime("%Y-%m-%d")
+
     all_data_frames = []
 
     print(f"--- BẮT ĐẦU CRAWL DỮ LIỆU VN30 ---")
     print(f"Khoảng thời gian: {start_date} đến {end_date}")
 
     for symbol in vn30_list:
-        print(f"Đang xử lý: {symbol}...", end=" ")
-
-        try:
-            params = {
-                'symbol': symbol,
-                'startDate': start_date,
-                'endDate': end_date
-            }
-
-            response = requests.get(base_url, params=params, headers=headers, timeout=15)
-
-            if response.status_code == 200:
-                data = response.json()
-
-                if data and isinstance(data, list) and len(data) > 0:
-                    # Chuyển đổi list of dictionaries thành DataFrame
-                    # Pandas sẽ tự động tạo cột cho TẤT CẢ các key có trong JSON (bao gồm AdjRatio, PE, PB...)
-                    df_temp = pd.DataFrame(data)
-
-                    # Đảm bảo cột Symbol chính xác (đề phòng API trả về null ở cột này)
-                    df_temp['Symbol'] = symbol
-
-                    # Xử lý format ngày tháng cho chuẩn Excel/CSV
-                    if 'Date' in df_temp.columns:
-                        df_temp['Date'] = pd.to_datetime(df_temp['Date']).dt.date
-
-                    all_data_frames.append(df_temp)
-                    print(f"OK! Lấy được {len(df_temp)} bản ghi.")
-                else:
-                    print("Không có dữ liệu trả về.")
-            else:
-                print(f"Lỗi HTTP: {response.status_code}")
-
-        except Exception as e:
-            print(f"Lỗi ngoại lệ: {e}")
-
+        df = get_stock_data(symbol, start_date, end_date)
+        if df is not None:
+            all_data_frames.append(df)
+        
         # Delay để tránh bị chặn IP
         time.sleep(1.5)
 
@@ -75,20 +96,16 @@ def get_full_vn30_history():
     if all_data_frames:
         print("\nĐang tổng hợp dữ liệu...")
         final_df = pd.concat(all_data_frames, ignore_index=True)
-
-        final_df = final_df[['Date', 'Symbol' , 'AdjClose', 'AdjOpen', 'AdjHigh', 'AdjLow','Volume']]\
-            .rename(columns = {'AdjClose' : 'Close', 'AdjOpen' : 'Open', 'AdjHigh' : 'High', 'AdjLow' : 'Low'})
+        
         # Đặt tên file có timestamp
         file_name = f"VN30_Full_History_Raw_{datetime.now().strftime('%Y%m%d')}.csv"
 
-        # Lưu file CSV với encoding utf-8-sig để đọc được tiếng Việt và ký tự đặc biệt trên Excel
+        # Lưu file CSV
         final_df.to_csv(file_name, index=False, encoding='utf-8-sig')
 
         print("-" * 50)
         print(f"HOÀN TẤT!")
         print(f"Tổng số dòng: {len(final_df)}")
-        print(f"Số lượng cột (fields): {len(final_df.columns)}")
-        print(f"Các cột đã crawl: {list(final_df.columns)}")
         print(f"File đã lưu: {file_name}")
 
         return final_df

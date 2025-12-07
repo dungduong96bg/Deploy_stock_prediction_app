@@ -1,6 +1,5 @@
 import os
 from Get_Data import get_full_vn30_history, get_data_version, vn30_list
-from LSTM_DNN_CORE import build_simple_lstm_dnn
 from Data_Prepareration import StockPricePredictionPipeline
 
 
